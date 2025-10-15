@@ -10,11 +10,28 @@ use futures_util::stream::StreamExt;
 use futures_util::Stream;
 use http::HeaderMap;
 use tokio::sync::RwLock;
-use tokio_tungstenite::connect_async;
+use tokio_tungstenite::{connect_async_with_config};
 use tungstenite::client::IntoClientRequest;
 use url::Url;
 
 use super::websocket_general::AsyncWebsocketGeneralTransport;
+use tokio::net::TcpStream;
+use tokio_tungstenite::{
+    WebSocketStream,
+    MaybeTlsStream,
+    tungstenite::protocol::WebSocketConfig,
+};
+
+fn eager_ws_config() -> WebSocketConfig {
+    WebSocketConfig { write_buffer_size: 0, ..Default::default() }
+}
+
+fn enable_nodelay(ws: &mut WebSocketStream<MaybeTlsStream<TcpStream>>) {
+    match ws.get_mut() {
+        MaybeTlsStream::Plain(tcp) => { let _ = tcp.set_nodelay(true); }
+        _ => { panic!("Unsupported TLS stream"); }
+    }
+}
 
 /// An asynchronous websocket transport type.
 /// This type only allows for plain websocket
@@ -38,7 +55,8 @@ impl WebsocketTransport {
             req.headers_mut().extend(map);
         }
 
-        let (ws_stream, _) = connect_async(req).await?;
+        let (mut ws_stream, _) = connect_async_with_config(req, Some(eager_ws_config()), true).await?;
+        enable_nodelay(&mut ws_stream);
         let (sen, rec) = ws_stream.split();
 
         let inner = AsyncWebsocketGeneralTransport::new(sen, rec).await;
