@@ -55,7 +55,7 @@ impl WebsocketSecureTransport {
         let (ws_stream, _) = connect_async_tls_with_config(
             req,
             None,
-            /*disable_nagle=*/ false,
+            /*disable_nagle=*/ true,
             tls_config.map(Connector::NativeTls),
         )
         .await?;
