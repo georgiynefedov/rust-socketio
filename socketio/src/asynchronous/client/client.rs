@@ -285,6 +285,14 @@ impl Client {
             .await
     }
 
+    /// Whether this client is currently connected, i.e. whether `emit` and
+    /// `emit_with_ack` can succeed rather than failing with
+    /// `Error::IllegalActionBeforeOpen`. Callers that emit on a timer can use
+    /// this to skip a tick while a reconnect is in flight.
+    pub async fn is_connected(&self) -> bool {
+        self.socket.read().await.is_connected()
+    }
+
     /// Disconnects this client from the server by sending a `socket.io` closing
     /// packet.
     /// # Example
