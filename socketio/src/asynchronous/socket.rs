@@ -63,7 +63,7 @@ impl Socket {
 
     /// Sends a `socket.io` packet to the server using the `engine.io` client.
     pub async fn send(&self, packet: Packet) -> Result<()> {
-        if !self.is_engineio_connected() || !self.connected.load(Ordering::Acquire) {
+        if !self.is_connected() {
             return Err(Error::IllegalActionBeforeOpen());
         }
 
@@ -163,6 +163,12 @@ impl Socket {
 
     fn is_engineio_connected(&self) -> bool {
         self.engine_client.is_connected()
+    }
+
+    /// Whether the underlying engine.io transport is up and the `socket.io`
+    /// namespace has been joined, i.e. whether `send` can succeed.
+    pub fn is_connected(&self) -> bool {
+        self.is_engineio_connected() && self.connected.load(Ordering::Acquire)
     }
 }
 
