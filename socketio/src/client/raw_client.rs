@@ -2,14 +2,16 @@ use super::callback::Callback;
 use crate::packet::{Packet, PacketId};
 use crate::Error;
 pub(crate) use crate::{event::CloseReason, event::Event, payload::Payload};
-use rand::{thread_rng, Rng};
 use serde_json::Value;
 
 use crate::client::callback::{SocketAnyCallback, SocketCallback};
 use crate::error::Result;
 use std::collections::HashMap;
 use std::ops::DerefMut;
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    atomic::{AtomicBool, AtomicI32, Ordering},
+    Arc, Mutex,
+};
 use std::time::Duration;
 use std::time::Instant;
 
@@ -37,6 +39,8 @@ pub struct RawClient {
     on: Arc<Mutex<HashMap<Event, Callback<SocketCallback>>>>,
     on_any: Arc<Mutex<Option<Callback<SocketAnyCallback>>>>,
     outstanding_acks: Arc<Mutex<Vec<Ack>>>,
+    next_ack_id: Arc<AtomicI32>,
+    ack_gc_started: Arc<AtomicBool>,
     // namespace, for multiplexing messages
     nsp: String,
     // Data send in the opening packet (commonly used as for auth)
@@ -61,6 +65,8 @@ impl RawClient {
             on,
             on_any,
             outstanding_acks: Arc::new(Mutex::new(Vec::new())),
+            next_ack_id: Arc::new(AtomicI32::new(0)),
+            ack_gc_started: Arc::new(AtomicBool::new(false)),
             auth,
         })
     }
@@ -69,6 +75,7 @@ impl RawClient {
     /// called to interact with the server. Attention: it's not allowed to add a
     /// callback after a call to this method.
     pub(crate) fn connect(&self) -> Result<()> {
+        self.spawn_ack_gc();
         // Connect the underlying socket
         self.socket.connect()?;
 
@@ -80,6 +87,34 @@ impl RawClient {
         self.socket.send(open_packet)?;
 
         Ok(())
+    }
+
+    fn allocate_ack_id(&self) -> i32 {
+        self.next_ack_id
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                Some(if current >= i32::MAX { 1 } else { current + 1 })
+            })
+            .map(|previous| {
+                if previous >= i32::MAX {
+                    1
+                } else {
+                    previous + 1
+                }
+            })
+            .unwrap_or(1)
+    }
+
+    fn spawn_ack_gc(&self) {
+        if self.ack_gc_started.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        let outstanding_acks = Arc::clone(&self.outstanding_acks);
+        std::thread::spawn(move || loop {
+            std::thread::sleep(Duration::from_secs(1));
+            if let Ok(mut acks) = outstanding_acks.lock() {
+                reap_expired_acks(&mut acks);
+            }
+        });
     }
 
     /// Sends a message to the server using the underlying `engine.io` protocol.
@@ -203,7 +238,7 @@ impl RawClient {
         E: Into<Event>,
         D: Into<Payload>,
     {
-        let id = thread_rng().gen_range(0..999);
+        let id = self.allocate_ack_id();
         let socket_packet =
             Packet::new_from_payload(data.into(), event.into(), &self.nsp, Some(id))?;
 
@@ -214,8 +249,10 @@ impl RawClient {
             callback: Callback::<SocketCallback>::new(callback),
         };
 
-        // add the ack to the tuple of outstanding acks
-        self.outstanding_acks.lock()?.push(ack);
+        let mut outstanding_acks = self.outstanding_acks.lock()?;
+        reap_expired_acks(&mut outstanding_acks);
+        outstanding_acks.push(ack);
+        drop(outstanding_acks);
 
         self.socket.send(socket_packet)?;
         Ok(())
@@ -279,10 +316,11 @@ impl RawClient {
 
         let outstanding_ack = {
             let mut outstanding_acks = self.outstanding_acks.lock()?;
+            reap_expired_acks(&mut outstanding_acks);
             outstanding_acks
                 .iter()
-                .position(|ack| ack.id == id)
-                .map(|pos| outstanding_acks.remove(pos))
+                .rposition(|ack| ack.id == id)
+                .map(|pos| outstanding_acks.swap_remove(pos))
         };
 
         // If we found a matching ack, call its callback otherwise ignore it.
@@ -397,6 +435,10 @@ impl RawClient {
         }
         Ok(())
     }
+}
+
+fn reap_expired_acks(acks: &mut Vec<Ack>) {
+    acks.retain(|ack| ack.time_started.elapsed() < ack.timeout);
 }
 
 pub struct Iter<'a> {

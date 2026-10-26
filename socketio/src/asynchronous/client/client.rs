@@ -1,9 +1,15 @@
-use std::{ops::DerefMut, pin::Pin, sync::Arc};
+use std::{
+    ops::DerefMut,
+    pin::Pin,
+    sync::{
+        atomic::{AtomicBool, AtomicI32, Ordering},
+        Arc,
+    },
+};
 
 use backoff::{backoff::Backoff, ExponentialBackoffBuilder};
 use futures_util::{future::BoxFuture, stream, Stream, StreamExt};
 use log::{error, trace};
-use rand::{thread_rng, Rng};
 use rust_engineio::header::{HeaderMap, HeaderValue};
 use serde_json::Value;
 use tokio::{
@@ -83,6 +89,8 @@ pub struct Client {
     /// The inner socket client to delegate the methods to.
     socket: Arc<RwLock<InnerSocket>>,
     outstanding_acks: Arc<RwLock<Vec<Ack>>>,
+    next_ack_id: Arc<AtomicI32>,
+    ack_gc_started: Arc<AtomicBool>,
     // namespace, for multiplexing messages
     nsp: String,
     // Data send in the opening packet (commonly used as for auth)
@@ -101,6 +109,8 @@ impl Client {
             socket: Arc::new(RwLock::new(socket)),
             nsp: builder.namespace.to_owned(),
             outstanding_acks: Arc::new(RwLock::new(Vec::new())),
+            next_ack_id: Arc::new(AtomicI32::new(0)),
+            ack_gc_started: Arc::new(AtomicBool::new(false)),
             auth: builder.auth.clone(),
             builder: Arc::new(RwLock::new(builder)),
             disconnect_reason: Arc::new(RwLock::new(DisconnectReason::default())),
@@ -166,6 +176,7 @@ impl Client {
         let reconnect_on_disconnect = builder.reconnect_on_disconnect;
         drop(builder);
 
+        self.spawn_ack_gc();
         let mut client_clone = self.clone();
 
         tokio::runtime::Handle::current().spawn(async move {
@@ -401,7 +412,7 @@ impl Client {
         E: Into<Event>,
         D: Into<Payload>,
     {
-        let id = thread_rng().gen_range(0..999);
+        let id = self.allocate_ack_id();
         let socket_packet =
             Packet::new_from_payload(data.into(), event.into(), &self.nsp, Some(id))?;
 
@@ -439,39 +450,64 @@ impl Client {
         Ok(())
     }
 
+    fn allocate_ack_id(&self) -> i32 {
+        self.next_ack_id
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                Some(if current >= i32::MAX { 1 } else { current + 1 })
+            })
+            .map(|previous| {
+                if previous >= i32::MAX {
+                    1
+                } else {
+                    previous + 1
+                }
+            })
+            .unwrap_or(1)
+    }
+
+    fn spawn_ack_gc(&self) {
+        if self.ack_gc_started.swap(true, Ordering::Relaxed) {
+            return;
+        }
+        let outstanding_acks = Arc::clone(&self.outstanding_acks);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(1));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                interval.tick().await;
+                outstanding_acks
+                    .write()
+                    .await
+                    .retain(|ack| ack.time_started.elapsed() < ack.timeout);
+            }
+        });
+    }
+
     /// Handles the incoming acks and classifies what callbacks to call and how.
     #[inline]
     async fn handle_ack(&self, socket_packet: &Packet) -> Result<()> {
-        let mut to_be_removed = Vec::new();
-        if let Some(id) = socket_packet.id {
-            for (index, ack) in self.outstanding_acks.write().await.iter_mut().enumerate() {
-                if ack.id == id {
-                    to_be_removed.push(index);
+        let Some(id) = socket_packet.id else {
+            return Ok(());
+        };
 
-                    if ack.time_started.elapsed() < ack.timeout {
-                        if let Some(ref payload) = socket_packet.data {
-                            ack.callback.deref_mut()(
-                                Payload::from(payload.to_owned()),
-                                self.clone(),
-                            )
-                            .await;
-                        }
-                        if let Some(ref attachments) = socket_packet.attachments {
-                            if let Some(payload) = attachments.get(0) {
-                                ack.callback.deref_mut()(
-                                    Payload::Binary(payload.to_owned()),
-                                    self.clone(),
-                                )
-                                .await;
-                            }
-                        }
-                    } else {
-                        trace!("Received an Ack that is now timed out (elapsed time was longer than specified duration)");
-                    }
-                }
-            }
-            for index in to_be_removed {
-                self.outstanding_acks.write().await.remove(index);
+        let mut ack = {
+            let mut outstanding_acks = self.outstanding_acks.write().await;
+            let Some(index) = outstanding_acks.iter().rposition(|ack| ack.id == id) else {
+                return Ok(());
+            };
+            outstanding_acks.swap_remove(index)
+        };
+
+        if ack.time_started.elapsed() >= ack.timeout {
+            trace!("Received an Ack that is now timed out (elapsed time was longer than specified duration)");
+            return Ok(());
+        }
+        if let Some(ref payload) = socket_packet.data {
+            ack.callback.deref_mut()(Payload::from(payload.to_owned()), self.clone()).await;
+        }
+        if let Some(ref attachments) = socket_packet.attachments {
+            if let Some(payload) = attachments.first() {
+                ack.callback.deref_mut()(Payload::Binary(payload.to_owned()), self.clone()).await;
             }
         }
         Ok(())
